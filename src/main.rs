@@ -30,9 +30,6 @@ struct Args {
     #[arg(long = "timeout", default_value_t = 60)]
     timeout: u64,
 
-    #[arg(long = "6")]
-    ipv6: bool,
-
     #[arg(long = "remove_ports")]
     remove_ports: bool,
 }
@@ -67,19 +64,6 @@ async fn main() -> anyhow::Result<()> {
     // Ping proxy socket on port 19132 (IPv4)
     let ping_socket = UdpSocket::bind("0.0.0.0:19132").await?;
 
-    // Optional IPv6 ping
-    let ping_socket_v6 = if args.ipv6 {
-        match UdpSocket::bind("[::]:19133").await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                warn!("Failed to bind IPv6 ping listener: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let client_map = ClientMap::new(Duration::from_secs(args.timeout), Duration::from_secs(5));
 
     // Unique server id
@@ -99,25 +83,6 @@ async fn main() -> anyhow::Result<()> {
             remove_ports,
         )
     };
-
-    // if let Some(pv6) = &ping_socket_v6 {
-    //     let server_socket = server_socket.clone();
-    //     let remote_addr = remote_addr.clone();
-    //     let remove_ports = args.remove_ports;
-    //     let server_id = server_id;
-    //     let client_map = &client_map;
-    //     spawn_local(async move {
-    //         read_loop(
-    //             pv6,
-    //             server_socket,
-    //             client_map,
-    //             remote_addr,
-    //             server_id,
-    //             remove_ports,
-    //         )
-    //         .await;
-    //     });
-    // }
 
     let proxy_task = {
         let remote_addr = remote_addr.clone();
