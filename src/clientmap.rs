@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+use log::trace;
 use tokio::net::UdpSocket;
 use tokio::task::spawn_local;
 
@@ -41,6 +42,7 @@ impl ClientMap {
                     }
                     let mut inner = map.inner.borrow_mut();
                     for k in to_remove {
+                        trace!("Removing idle client connection: {}", k);
                         inner.remove(&k);
                     }
                 }
