@@ -17,7 +17,10 @@
             "args": [
                     "--server",
                     "10.0.0.64:19133"
-            ]
+            ],
+            "env": {
+                "RUST_LOG": "trace"
+            }
         },
         {
             "name": "Debug unit tests in executable 'phantom'",

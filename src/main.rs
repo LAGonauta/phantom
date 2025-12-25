@@ -1,12 +1,14 @@
 use clap::Parser;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use rand::Rng;
-use tokio::task::spawn_local;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::select;
 use tokio::sync::Mutex;
+use tokio::task::spawn_local;
 use tokio::time::sleep;
 
 mod clientmap;
@@ -37,9 +39,6 @@ struct Args {
 
     #[arg(long = "remove_ports")]
     remove_ports: bool,
-
-    #[arg(long = "workers", default_value_t = 1)]
-    workers: u32,
 }
 
 #[tokio::main(flavor = "local")]
@@ -67,17 +66,15 @@ async fn main() -> anyhow::Result<()> {
     let bind_socket_addr: SocketAddr = bind_addr.to_socket_addrs()?.next().unwrap();
 
     // Create server socket (UDP) with reuse options
-    let server_socket = UdpSocket::bind(bind_socket_addr).await?;
-    let server_socket = Arc::new(server_socket);
+    let server_socket = Rc::new(UdpSocket::bind(bind_socket_addr).await?);
 
     // Ping server socket on port 19132 (IPv4)
     let ping_socket = UdpSocket::bind("0.0.0.0:19132").await?;
-    let ping_socket = Arc::new(ping_socket);
 
     // Optional IPv6 ping
     let ping_socket_v6 = if args.ipv6 {
         match UdpSocket::bind("[::]:19133").await {
-            Ok(s) => Some(Arc::new(s)),
+            Ok(s) => Some(s),
             Err(e) => {
                 warn!("Failed to bind IPv6 ping listener: {}", e);
                 None
@@ -87,62 +84,77 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let client_map = Arc::new(Mutex::new(ClientMap::new(Duration::from_secs(args.timeout), Duration::from_secs(5))));
+    let client_map = ClientMap::new(Duration::from_secs(args.timeout), Duration::from_secs(5));
 
     // Unique server id
     let server_id: i64 = rand::random::<i64>();
 
-    // Spawn ping read loops
-    {
-        let server_socket = server_socket.clone();
-        let client_map = client_map.clone();
+    // Spawn ping read loops task
+    let ping_task = {
         let remote_addr = remote_addr.clone();
         let remove_ports = args.remove_ports;
         let server_id = server_id;
-        spawn_local(async move {
-            read_loop(ping_socket.clone(), server_socket, client_map, remote_addr, server_id, remove_ports).await;
-        });
-    }
+        read_loop(
+            &ping_socket,
+            server_socket.clone(),
+            &client_map,
+            remote_addr,
+            server_id,
+            remove_ports,
+        )
+    };
 
-    if let Some(pv6) = ping_socket_v6 {
-        let server_socket = server_socket.clone();
-        let client_map = client_map.clone();
+    // if let Some(pv6) = &ping_socket_v6 {
+    //     let server_socket = server_socket.clone();
+    //     let remote_addr = remote_addr.clone();
+    //     let remove_ports = args.remove_ports;
+    //     let server_id = server_id;
+    //     let client_map = &client_map;
+    //     spawn_local(async move {
+    //         read_loop(
+    //             pv6,
+    //             server_socket,
+    //             client_map,
+    //             remote_addr,
+    //             server_id,
+    //             remove_ports,
+    //         )
+    //         .await;
+    //     });
+    // }
+
+    let proxy_task = {
         let remote_addr = remote_addr.clone();
         let remove_ports = args.remove_ports;
         let server_id = server_id;
-        spawn_local(async move {
-            read_loop(pv6, server_socket, client_map, remote_addr, server_id, remove_ports).await;
-        });
+        proxy_listen_loop(
+            server_socket,
+            &client_map,
+            remote_addr,
+            server_id,
+            remove_ports,
+        )
+    };
+
+    select! {
+        _ = ping_task => {
+            error!("Ping task exited unexpectedly");
+        },
+        _ = proxy_task => {
+            error!("Proxy task exited unexpectedly");
+        },
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutdown requested, exiting");
+        },
     }
-
-    // Start workers for main listener
-    for i in 0..args.workers {
-        let server_socket = server_socket.clone();
-        let client_map = client_map.clone();
-        let remote_addr = remote_addr.clone();
-        let server_id = server_id;
-        let remove_ports = args.remove_ports;
-
-        if i < args.workers - 1 {
-            spawn_local(async move {
-                proxy_listen_loop(server_socket, client_map, remote_addr, server_id, remove_ports).await;
-            });
-        } else {
-            proxy_listen_loop(server_socket, client_map, remote_addr, server_id, remove_ports).await;
-        }
-    }
-
-    // Keep the program alive until CTRL+C
-    tokio::signal::ctrl_c().await?;
-    info!("Shutdown requested, exiting");
 
     Ok(())
 }
 
 async fn read_loop(
-    listener: Arc<UdpSocket>,
-    server_socket: Arc<UdpSocket>,
-    client_map: Arc<Mutex<ClientMap>>,
+    listener: &UdpSocket,
+    server_socket: Rc<UdpSocket>,
+    client_map: &ClientMap,
     remote: SocketAddr,
     server_id: i64,
     remove_ports: bool,
@@ -166,9 +178,7 @@ async fn read_loop(
                 }
 
                 // Use same proxy logic as main listener: forward to server via per-client socket
-                let cm = client_map.lock().await;
-                let (sock, created) = cm.get(addr, remote).await.unwrap();
-                drop(cm);
+                let (sock, created) = client_map.get(addr, remote).await.unwrap();
 
                 if created {
                     // spawn reader for server->client
@@ -190,8 +200,8 @@ async fn read_loop(
 }
 
 async fn proxy_listen_loop(
-    listener: Arc<UdpSocket>,
-    client_map: Arc<Mutex<ClientMap>>,
+    listener: Rc<UdpSocket>,
+    client_map: &ClientMap,
     remote: SocketAddr,
     server_id: i64,
     remove_ports: bool,
@@ -208,14 +218,12 @@ async fn proxy_listen_loop(
                 let data = buf[..len].to_vec();
                 debug!("client recv: {} from {}", len, addr);
 
-                let cm = client_map.lock().await;
-                let (sock, created) = cm.get(addr, remote).await.unwrap();
-                drop(cm);
+                let (sock, created) = client_map.get(addr, remote).await.unwrap();
 
                 if created {
                     let sock_clone = sock.clone();
                     let server_listener = listener.clone();
-                    tokio::spawn(async move {
+                    spawn_local(async move {
                         proxy_server_reader(sock_clone, addr, server_listener).await;
                     });
                 }
@@ -232,7 +240,11 @@ async fn proxy_listen_loop(
     }
 }
 
-async fn proxy_server_reader(server_conn: Arc<UdpSocket>, client: std::net::SocketAddr, server_listener: Arc<UdpSocket>) {
+async fn proxy_server_reader(
+    server_conn: Rc<UdpSocket>,
+    client: SocketAddr,
+    server_listener: Rc<UdpSocket>,
+) {
     let mut buf = vec![0u8; MAX_MTU];
 
     loop {

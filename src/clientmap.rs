@@ -1,18 +1,20 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::task::spawn_local;
 
+#[derive(Clone)]
 pub struct ClientMap {
     pub idle_timeout: Duration,
     pub idle_check_interval: Duration,
-    inner: Arc<TokioMutex<HashMap<String, ClientEntry>>>,
+    inner: Rc<RefCell<HashMap<String, ClientEntry>>>,
 }
 
 struct ClientEntry {
-    socket: Arc<UdpSocket>,
+    socket: Rc<UdpSocket>,
     last_active: Instant,
 }
 
@@ -21,26 +23,26 @@ impl ClientMap {
         let map = ClientMap {
             idle_timeout,
             idle_check_interval,
-            inner: Arc::new(TokioMutex::new(HashMap::new())),
+            inner: Rc::new(RefCell::new(HashMap::new())),
         };
 
         // Spawn cleanup task
-        let inner_clone = map.inner.clone();
-        let idle = map.idle_timeout;
-        let interval = map.idle_check_interval;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let mut guard = inner_clone.lock().await;
-                let now = Instant::now();
-                let mut to_remove = Vec::new();
-                for (k, v) in guard.iter() {
-                    if v.last_active + idle < now {
-                        to_remove.push(k.clone());
+        spawn_local({
+            let map = map.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(map.idle_check_interval).await;
+                    let now = Instant::now();
+                    let mut to_remove = Vec::new();
+                    for (k, v) in map.inner.borrow().iter() {
+                        if v.last_active + map.idle_timeout < now {
+                            to_remove.push(k.clone());
+                        }
                     }
-                }
-                for k in to_remove {
-                    guard.remove(&k);
+                    let mut inner = map.inner.borrow_mut();
+                    for k in to_remove {
+                        inner.remove(&k);
+                    }
                 }
             }
         });
@@ -50,12 +52,15 @@ impl ClientMap {
 
     // Get or create a connection to remote for a client address.
     // Returns (socket, created)
-    pub async fn get(&self, client: SocketAddr, remote: SocketAddr) -> anyhow::Result<(Arc<UdpSocket>, bool)> {
+    pub async fn get(
+        &self,
+        client: SocketAddr,
+        remote: SocketAddr,
+    ) -> anyhow::Result<(Rc<UdpSocket>, bool)> {
         let key = client.to_string();
 
-        let mut guard = self.inner.lock().await;
-
-        if let Some(entry) = guard.get_mut(&key) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(entry) = inner.get_mut(&key) {
             entry.last_active = Instant::now();
             return Ok((entry.socket.clone(), false));
         }
@@ -66,11 +71,13 @@ impl ClientMap {
             std::net::IpAddr::V6(_) => "[::]:0",
         };
 
+        drop(inner); // Release borrow before await
+
         let sock = UdpSocket::bind(local).await?;
         sock.connect(remote).await?;
-        let arc = Arc::new(sock);
+        let arc = Rc::new(sock);
 
-        guard.insert(
+        self.inner.borrow_mut().insert(
             key,
             ClientEntry {
                 socket: arc.clone(),
