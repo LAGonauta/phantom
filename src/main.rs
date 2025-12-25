@@ -1,4 +1,6 @@
 use clap::Parser;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use log::{debug, error, info, trace, warn};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
@@ -20,12 +22,6 @@ const MAX_MTU: usize = 1472;
 struct Args {
     #[arg(short = 's', long = "server")]
     server: String,
-
-    #[arg(long = "bind", default_value = "0.0.0.0")]
-    bind: String,
-
-    #[arg(long = "bind_port", default_value_t = 0)]
-    bind_port: u16,
 
     #[arg(long = "timeout", default_value_t = 60)]
     timeout: u64,
@@ -49,61 +45,46 @@ async fn main() -> anyhow::Result<()> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("Failed to resolve server address"))?;
 
-    // Determine bind port (randomize if 0 similar to Go)
-    let mut bind_port = args.bind_port;
-    if bind_port == 0 {
-        bind_port = (rand::random::<u16>() % 14000) + 50000;
+
+    let local_addrs = vec!["[::]:19132".to_string(), "[::]:19133".to_string()]
+        .into_iter()
+        .map(|addr| addr.to_socket_addrs())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let mut sockets = Vec::new();
+    for addr in local_addrs {
+        info!("Trying to listen on {}", addr);
+        let socket = UdpSocket::bind(addr).await?;
+        info!("Listening on {}", socket.local_addr()?);
+        sockets.push(Rc::new(socket));
     }
-
-    let bind_addr = format!("{}:{}", args.bind, bind_port);
-    let bind_socket_addr: SocketAddr = bind_addr.to_socket_addrs()?.next().unwrap();
-
-    // Create proxy socket (UDP) with reuse options
-    let proxy_socket = Rc::new(UdpSocket::bind(bind_socket_addr).await?);
-    debug!("Proxy socket bound to {}", bind_socket_addr);
-
-    // Ping proxy socket on port 19132 (IPv4)
-    let ping_socket = Rc::new(UdpSocket::bind("0.0.0.0:19132").await?);
-    debug!("Ping socket bound to {}", ping_socket.local_addr()?);
 
     let client_map = ClientMap::new(Duration::from_secs(args.timeout), Duration::from_secs(5));
 
     // Unique server id
     let server_id: i64 = rand::random::<i64>();
 
-    // Spawn ping read loops task
-    let ping_task = {
+    let read_loops = sockets.into_iter().map(|socket| {
         let remote_addr = remote_addr.clone();
-        let remove_ports = args.remove_ports;
+        let client_map = &client_map;
         let server_id = server_id;
+        let remove_ports = args.remove_ports;
         read_loop(
-            ping_socket,
-            &client_map,
+            socket,
+            client_map,
             remote_addr,
             server_id,
             remove_ports,
         )
-    };
+    });
 
-    let proxy_task = {
-        let remote_addr = remote_addr.clone();
-        let remove_ports = args.remove_ports;
-        let server_id = server_id;
-        read_loop(
-            proxy_socket,
-            &client_map,
-            remote_addr,
-            server_id,
-            remove_ports,
-        )
-    };
-
+    let mut read_loops = FuturesUnordered::from_iter(read_loops);
     select! {
-        _ = ping_task => {
-            error!("Ping task exited unexpectedly");
-        },
-        _ = proxy_task => {
-            error!("Proxy task exited unexpectedly");
+        _ = read_loops.next() => {
+            error!("A read loop exited unexpectedly");
         },
         _ = tokio::signal::ctrl_c() => {
             info!("Shutdown requested, exiting");
