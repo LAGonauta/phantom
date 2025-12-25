@@ -60,9 +60,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Create proxy socket (UDP) with reuse options
     let proxy_socket = Rc::new(UdpSocket::bind(bind_socket_addr).await?);
+    debug!("Proxy socket bound to {}", bind_socket_addr);
 
     // Ping proxy socket on port 19132 (IPv4)
     let ping_socket = UdpSocket::bind("0.0.0.0:19132").await?;
+    debug!("Ping socket bound to {}", ping_socket.local_addr()?);
 
     let client_map = ClientMap::new(Duration::from_secs(args.timeout), Duration::from_secs(5));
 
@@ -215,7 +217,7 @@ async fn proxy_server_reader(
                     continue;
                 }
                 let data = buf[..len].to_vec();
-                debug!(
+                trace!(
                     "Received {} bytes from server {}, sending to {}",
                     len,
                     server_socket.peer_addr().unwrap(),
