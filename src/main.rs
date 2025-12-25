@@ -169,7 +169,7 @@ async fn read_loop(
                     continue;
                 }
 
-                trace!("Received {} bytes from client {}", len, addr);
+                trace!("Received {} bytes from client {}, sending to {}", len, addr, remote);
 
                 let data = buf[..len].to_vec();
 
