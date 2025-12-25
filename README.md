@@ -2,11 +2,13 @@
 
 This repo is an experiment to see how good would an AI be to port code from Go to Rust. The initial commit is almost entirely vibe coded, with some fixes.
 
-All other commits are handmade to properly port Phantom to Rust
+All other commits are handmade to properly port Phantom to Rust, and the make it more rusty.
 
 # Why?
 
 For fun, and to understand how well AI can port code bases.
+
+# Badges
 
 [![Downloads](https://img.shields.io/github/downloads/jhead/phantom/total)](https://github.com/jhead/phantom/releases) [![Gitter](https://badges.gitter.im/phantom-minecraft/community.svg)](https://gitter.im/phantom-minecraft/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
 
