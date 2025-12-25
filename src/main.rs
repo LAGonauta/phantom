@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     debug!("Proxy socket bound to {}", bind_socket_addr);
 
     // Ping proxy socket on port 19132 (IPv4)
-    let ping_socket = UdpSocket::bind("0.0.0.0:19132").await?;
+    let ping_socket = Rc::new(UdpSocket::bind("0.0.0.0:19132").await?);
     debug!("Ping socket bound to {}", ping_socket.local_addr()?);
 
     let client_map = ClientMap::new(Duration::from_secs(args.timeout), Duration::from_secs(5));
@@ -77,8 +77,7 @@ async fn main() -> anyhow::Result<()> {
         let remove_ports = args.remove_ports;
         let server_id = server_id;
         read_loop(
-            &ping_socket,
-            proxy_socket.clone(),
+            ping_socket,
             &client_map,
             remote_addr,
             server_id,
@@ -91,8 +90,7 @@ async fn main() -> anyhow::Result<()> {
         let remove_ports = args.remove_ports;
         let server_id = server_id;
         read_loop(
-            &proxy_socket,
-            proxy_socket.clone(),
+            proxy_socket,
             &client_map,
             remote_addr,
             server_id,
@@ -116,8 +114,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn read_loop(
-    listener: &UdpSocket,
-    proxy_socket: Rc<UdpSocket>,
+    listener: Rc<UdpSocket>,
     client_map: &ClientMap,
     remote: SocketAddr,
     server_id: i64,
@@ -147,9 +144,9 @@ async fn read_loop(
                 if created {
                     // spawn reader for server->client
                     let server_socket = server_socket.clone();
-                    let proxy_socket = proxy_socket.clone();
+                    let listener = listener.clone();
                     spawn_local(async move {
-                        proxy_server_reader(server_socket, addr, proxy_socket).await;
+                        proxy_server_reader(server_socket, addr, listener).await;
                     });
                 }
                 if let Some(packet_id) = buf.get(0) {
@@ -159,12 +156,12 @@ async fn read_loop(
                         info!("Received LAN ping from client: {}", addr);
                         if server_offline {
                             let pong = rewrite_unconnected_pong(
-                                &proxy_socket,
+                                &listener,
                                 server_id,
                                 remove_ports,
                                 &data,
                             );
-                            let _ = proxy_socket.send(&pong.unwrap()).await;
+                            let _ = listener.send(&pong.unwrap()).await;
                         }
                     }
                 }
