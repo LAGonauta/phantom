@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
         let remove_ports = args.remove_ports;
         let server_id = server_id;
         read_loop(
-            &ping_socket,
+            &proxy_socket,
             proxy_socket.clone(),
             &client_map,
             remote_addr,
