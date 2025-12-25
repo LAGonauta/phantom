@@ -1,5 +1,5 @@
 use clap::Parser;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use rand::Rng;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
@@ -65,10 +65,10 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = format!("{}:{}", args.bind, bind_port);
     let bind_socket_addr: SocketAddr = bind_addr.to_socket_addrs()?.next().unwrap();
 
-    // Create server socket (UDP) with reuse options
-    let server_socket = Rc::new(UdpSocket::bind(bind_socket_addr).await?);
+    // Create proxy socket (UDP) with reuse options
+    let proxy_socket = Rc::new(UdpSocket::bind(bind_socket_addr).await?);
 
-    // Ping server socket on port 19132 (IPv4)
+    // Ping proxy socket on port 19132 (IPv4)
     let ping_socket = UdpSocket::bind("0.0.0.0:19132").await?;
 
     // Optional IPv6 ping
@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         let server_id = server_id;
         read_loop(
             &ping_socket,
-            server_socket.clone(),
+            proxy_socket.clone(),
             &client_map,
             remote_addr,
             server_id,
@@ -127,8 +127,9 @@ async fn main() -> anyhow::Result<()> {
         let remote_addr = remote_addr.clone();
         let remove_ports = args.remove_ports;
         let server_id = server_id;
-        proxy_listen_loop(
-            server_socket,
+        read_loop(
+            &ping_socket,
+            proxy_socket.clone(),
             &client_map,
             remote_addr,
             server_id,
@@ -153,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn read_loop(
     listener: &UdpSocket,
-    server_socket: Rc<UdpSocket>,
+    proxy_socket: Rc<UdpSocket>,
     client_map: &ClientMap,
     remote: SocketAddr,
     server_id: i64,
@@ -168,28 +169,34 @@ async fn read_loop(
                     continue;
                 }
 
-                let data = buf[..len].to_vec();
-                debug!("ping recv {} from {}", len, addr);
+                trace!("Received {} bytes from client {}", len, addr);
 
-                // Handle unconnected ping/pong based on proto
-                if let Ok(Some(ping)) = proto::read_unconnected_ping(&data) {
-                    // If needed, we could respond directly; for simplicity pass through to proxy flow
-                    debug!("Parsed unconnected ping from {}", addr);
-                }
+                let data = buf[..len].to_vec();
 
                 // Use same proxy logic as main listener: forward to server via per-client socket
-                let (sock, created) = client_map.get(addr, remote).await.unwrap();
+                let (server_socket, created) = client_map.get(addr, remote).await.unwrap();
 
                 if created {
                     // spawn reader for server->client
-                    let sock_clone = sock.clone();
                     let server_socket = server_socket.clone();
+                    let proxy_socket = proxy_socket.clone();
                     spawn_local(async move {
-                        proxy_server_reader(sock_clone, addr, server_socket).await;
+                        proxy_server_reader(server_socket, addr, proxy_socket).await;
                     });
                 }
+                if let Some(packet_id) = buf.get(0) {
+                    let server_offline = false; // TODO
+                    // If server is offline, respond with empty pong
+                    if *packet_id == proto::UNCONNECTED_PING_ID {
+                        info!("Received LAN ping from client: {}", addr);
+                        if server_offline {
+                            let pong = rewrite_unconnected_pong(&proxy_socket, server_id, remove_ports, &data);
+                            let _ = proxy_socket.send(&pong.unwrap()).await;
+                        }
+                    }
+                }
 
-                let _ = sock.send(&data).await;
+                let _ = server_socket.send(&data).await;
             }
             Err(e) => {
                 warn!("ping listener error: {}", e);
@@ -199,65 +206,43 @@ async fn read_loop(
     }
 }
 
-async fn proxy_listen_loop(
-    listener: Rc<UdpSocket>,
-    client_map: &ClientMap,
-    remote: SocketAddr,
-    server_id: i64,
-    remove_ports: bool,
-) {
-    let mut buf = vec![0u8; MAX_MTU];
+fn rewrite_unconnected_pong(proxy_socket: &Rc<UdpSocket>, server_id: i64, remove_ports: bool, data: &Vec<u8>) -> Option<Vec<u8>> {
+    if let Ok(Some(mut ping)) = proto::read_unconnected_ping(data) {
+        // Modify server ID
+        ping.pong.server_id = server_id.to_string();
 
-    loop {
-        match listener.recv_from(&mut buf).await {
-            Ok((len, addr)) => {
-                if len == 0 {
-                    continue;
-                }
-
-                let data = buf[..len].to_vec();
-                debug!("client recv: {} from {}", len, addr);
-
-                let (sock, created) = client_map.get(addr, remote).await.unwrap();
-
-                if created {
-                    let sock_clone = sock.clone();
-                    let server_listener = listener.clone();
-                    spawn_local(async move {
-                        proxy_server_reader(sock_clone, addr, server_listener).await;
-                    });
-                }
-
-                // If this is an unconnected ping ID, we may want to handle offline pong rewriting later.
-
-                let _ = sock.send(&data).await;
-            }
-            Err(e) => {
-                warn!("proxy listener error: {}", e);
-                sleep(Duration::from_millis(100)).await;
-            }
+        if ping.pong.port4 != "" && !remove_ports {
+            ping.pong.port4 = proxy_socket.local_addr().unwrap().port().to_string();
+            ping.pong.port6 = ping.pong.port4.clone();
+        } else if remove_ports {
+            ping.pong.port4 = "".to_string();
+            ping.pong.port6 = "".to_string();
         }
+
+        Some(proto::build_unconnected_pong(&ping))
+    } else {
+        None
     }
 }
 
 async fn proxy_server_reader(
-    server_conn: Rc<UdpSocket>,
+    server_socket: Rc<UdpSocket>,
     client: SocketAddr,
-    server_listener: Rc<UdpSocket>,
+    proxy_socket: Rc<UdpSocket>,
 ) {
     let mut buf = vec![0u8; MAX_MTU];
 
     loop {
-        match server_conn.recv(&mut buf).await {
+        match server_socket.recv(&mut buf).await {
             Ok(len) => {
                 if len == 0 {
                     continue;
                 }
                 let data = buf[..len].to_vec();
-                debug!("server recv: {}", len);
+                debug!("Received {} bytes from server {}, sending to {}", len, server_socket.peer_addr().unwrap(), client);
 
                 // send back to client using the main server listener socket
-                let _ = server_listener.send_to(&data, client).await;
+                let _ = proxy_socket.send_to(&data, client).await;
             }
             Err(e) => {
                 warn!("server read error: {}", e);
