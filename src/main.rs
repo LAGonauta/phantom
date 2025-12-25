@@ -1,19 +1,15 @@
 use clap::Parser;
 use log::{debug, error, info, trace, warn};
-use rand::Rng;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::select;
-use tokio::sync::Mutex;
 use tokio::task::spawn_local;
 use tokio::time::sleep;
 
 mod clientmap;
 mod proto;
-mod util;
 
 use clientmap::ClientMap;
 
@@ -169,7 +165,12 @@ async fn read_loop(
                     continue;
                 }
 
-                trace!("Received {} bytes from client {}, sending to {}", len, addr, remote);
+                trace!(
+                    "Received {} bytes from client {}, sending to {}",
+                    len,
+                    addr,
+                    remote
+                );
 
                 let data = buf[..len].to_vec();
 
@@ -186,11 +187,16 @@ async fn read_loop(
                 }
                 if let Some(packet_id) = buf.get(0) {
                     let server_offline = false; // TODO
-                    // If server is offline, respond with empty pong
+                                                // If server is offline, respond with empty pong
                     if *packet_id == proto::UNCONNECTED_PING_ID {
                         info!("Received LAN ping from client: {}", addr);
                         if server_offline {
-                            let pong = rewrite_unconnected_pong(&proxy_socket, server_id, remove_ports, &data);
+                            let pong = rewrite_unconnected_pong(
+                                &proxy_socket,
+                                server_id,
+                                remove_ports,
+                                &data,
+                            );
                             let _ = proxy_socket.send(&pong.unwrap()).await;
                         }
                     }
@@ -206,7 +212,12 @@ async fn read_loop(
     }
 }
 
-fn rewrite_unconnected_pong(proxy_socket: &Rc<UdpSocket>, server_id: i64, remove_ports: bool, data: &Vec<u8>) -> Option<Vec<u8>> {
+fn rewrite_unconnected_pong(
+    proxy_socket: &Rc<UdpSocket>,
+    server_id: i64,
+    remove_ports: bool,
+    data: &Vec<u8>,
+) -> Option<Vec<u8>> {
     if let Ok(Some(mut ping)) = proto::read_unconnected_ping(data) {
         // Modify server ID
         ping.pong.server_id = server_id.to_string();
@@ -239,7 +250,12 @@ async fn proxy_server_reader(
                     continue;
                 }
                 let data = buf[..len].to_vec();
-                debug!("Received {} bytes from server {}, sending to {}", len, server_socket.peer_addr().unwrap(), client);
+                debug!(
+                    "Received {} bytes from server {}, sending to {}",
+                    len,
+                    server_socket.peer_addr().unwrap(),
+                    client
+                );
 
                 // send back to client using the main server listener socket
                 let _ = proxy_socket.send_to(&data, client).await;

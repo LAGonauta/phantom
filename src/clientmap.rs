@@ -73,18 +73,18 @@ impl ClientMap {
 
         drop(inner); // Release borrow before await
 
-        let sock = UdpSocket::bind(local).await?;
-        sock.connect(remote).await?;
-        let arc = Rc::new(sock);
+        let remote_sock = UdpSocket::bind(local).await?;
+        remote_sock.connect(remote).await?;
+        let remote_sock = Rc::new(remote_sock);
 
         self.inner.borrow_mut().insert(
             key,
             ClientEntry {
-                socket: arc.clone(),
+                socket: remote_sock.clone(),
                 last_active: Instant::now(),
             },
         );
 
-        Ok((arc, true))
+        Ok((remote_sock, true))
     }
 }
