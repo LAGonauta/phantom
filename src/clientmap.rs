@@ -5,12 +5,10 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::task::spawn_local;
 
-#[derive(Clone)]
 pub struct ClientMap {
     idle_timeout: Duration,
-    inner: Rc<RefCell<HashMap<String, ClientEntry>>>,
+    inner: RefCell<HashMap<String, ClientEntry>>,
 }
 
 struct ClientEntry {
@@ -22,7 +20,7 @@ impl ClientMap {
     pub fn new(idle_timeout: Duration) -> Self {
         ClientMap {
             idle_timeout,
-            inner: Rc::new(RefCell::new(HashMap::new())),
+            inner: RefCell::new(HashMap::new()),
         }
     }
 
