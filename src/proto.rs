@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read};
 
@@ -28,23 +29,23 @@ pub struct PongData {
     pub port6: String,
 }
 
-// Try to parse Unconnected Ping, return Some(unconnected) if looks valid
-pub fn read_unconnected_ping(buf: &[u8]) -> Result<Option<UnconnectedPing>, anyhow::Error> {
+// Try to parse Unconnected Ping, return Ok if looks valid
+pub fn read_unconnected_ping(buf: &[u8]) -> Result<UnconnectedPing, anyhow::Error> {
     if buf.len() < 1 {
-        return Ok(None);
+        return Err(anyhow!("Empty buffer"));
     }
 
     let mut cursor = Cursor::new(buf);
     let id = cursor.read_u8()?;
     if id != UNCONNECTED_PING_ID && id != UNCONNECTED_PONG_ID {
-        return Ok(None);
+        return Err(anyhow!("Not an Unconnected Ping or Pong"));
     }
 
     // For ping or pong, attempt to parse fields
     // Skip id for consistency
     // Ensure enough bytes
     if cursor.get_ref().len() < 1 + 8 + 8 + 16 + 2 {
-        return Ok(None);
+        return Err(anyhow!("Buffer too small for Unconnected Ping"));
     }
 
     // Move cursor back to start to read fully
@@ -64,12 +65,12 @@ pub fn read_unconnected_ping(buf: &[u8]) -> Result<Option<UnconnectedPing>, anyh
 
     let pong = read_pong(&pong_str);
 
-    Ok(Some(UnconnectedPing {
+    Ok(UnconnectedPing {
         ping_time,
         id: idb,
         magic,
         pong,
-    }))
+    })
 }
 
 fn read_pong(raw: &str) -> PongData {

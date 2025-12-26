@@ -1,3 +1,4 @@
+use anyhow::Result;
 use clap::Parser;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -137,14 +138,20 @@ async fn read_loop(
                     });
                 }
                 if let Some(packet_id) = buf.get(0) {
-                    let server_offline = false; // TODO
-                                                // If server is offline, respond with empty pong
+                    // TODO
+                    // If server is offline, respond with empty pong
+                    let server_offline = false;
                     if *packet_id == proto::UNCONNECTED_PING_ID {
                         info!("Received LAN ping from client: {}", addr);
                         if server_offline {
-                            let pong =
-                                rewrite_unconnected_pong(&listener, server_id, remove_ports, &data);
-                            let _ = listener.send(&pong.unwrap()).await;
+                            match rewrite_unconnected_pong(&listener, server_id, remove_ports, &data) {
+                                Ok(pong) => {
+                                    let _ = listener.send_to(&pong, addr).await;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to build pong response: {}", e);
+                                }
+                            }
                         }
                     }
                 }
@@ -164,9 +171,10 @@ fn rewrite_unconnected_pong(
     server_id: i64,
     remove_ports: bool,
     data: &Vec<u8>,
-) -> Option<Vec<u8>> {
-    if let Ok(Some(mut ping)) = proto::read_unconnected_ping(data) {
-        // Modify server ID
+) -> Result<Vec<u8>> {
+    proto::read_unconnected_ping(data).map(|mut ping| {
+		// Overwrite the server ID with one unique to this phantom instance.
+		// If we don't do this, the client will get confused if you restart phantom.
         ping.pong.server_id = server_id.to_string();
 
         if ping.pong.port4 != "" && !remove_ports {
@@ -177,10 +185,8 @@ fn rewrite_unconnected_pong(
             ping.pong.port6 = "".to_string();
         }
 
-        Some(proto::build_unconnected_pong(&ping))
-    } else {
-        None
-    }
+        proto::build_unconnected_pong(&ping)
+    })
 }
 
 async fn proxy_server_reader(
