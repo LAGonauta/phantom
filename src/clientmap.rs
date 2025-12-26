@@ -1,16 +1,15 @@
+use log::trace;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use log::trace;
 use tokio::net::UdpSocket;
 use tokio::task::spawn_local;
 
 #[derive(Clone)]
 pub struct ClientMap {
-    pub idle_timeout: Duration,
-    pub idle_check_interval: Duration,
+    idle_timeout: Duration,
     inner: Rc<RefCell<HashMap<String, ClientEntry>>>,
 }
 
@@ -20,36 +19,23 @@ struct ClientEntry {
 }
 
 impl ClientMap {
-    pub fn new(idle_timeout: Duration, idle_check_interval: Duration) -> Self {
-        let map = ClientMap {
+    pub fn new(idle_timeout: Duration) -> Self {
+        ClientMap {
             idle_timeout,
-            idle_check_interval,
             inner: Rc::new(RefCell::new(HashMap::new())),
-        };
+        }
+    }
 
-        // Spawn cleanup task
-        spawn_local({
-            let map = map.clone();
-            async move {
-                loop {
-                    tokio::time::sleep(map.idle_check_interval).await;
-                    let now = Instant::now();
-                    let mut to_remove = Vec::new();
-                    for (k, v) in map.inner.borrow().iter() {
-                        if v.last_active + map.idle_timeout < now {
-                            to_remove.push(k.clone());
-                        }
-                    }
-                    let mut inner = map.inner.borrow_mut();
-                    for k in to_remove {
-                        trace!("Removing idle client connection: {}", k);
-                        inner.remove(&k);
-                    }
-                }
+    pub fn cleanup(&self) {
+        let now = Instant::now();
+        self.inner.borrow_mut().retain(|k, val| {
+            if val.last_active + self.idle_timeout < now {
+                trace!("Removing idle client connection: {}", k);
+                false
+            } else {
+                true
             }
         });
-
-        map
     }
 
     // Get or create a connection to remote for a client address.
@@ -73,7 +59,8 @@ impl ClientMap {
             std::net::IpAddr::V6(_) => "[::]:0",
         };
 
-        drop(inner); // Release borrow before await
+        // Release borrow before await
+        drop(inner);
 
         let remote_sock = UdpSocket::bind(local).await?;
         remote_sock.connect(remote).await?;

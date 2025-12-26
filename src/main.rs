@@ -1,7 +1,7 @@
 use clap::Parser;
-use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use log::{debug, error, info, trace, warn};
+use futures::StreamExt;
+use log::{error, info, trace, warn};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::time::Duration;
@@ -45,7 +45,6 @@ async fn main() -> anyhow::Result<()> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("Failed to resolve server address"))?;
 
-
     let local_addrs = vec!["[::]:19132".to_string(), "[::]:19133".to_string()]
         .into_iter()
         .map(|addr| addr.to_socket_addrs())
@@ -62,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         sockets.push(Rc::new(socket));
     }
 
-    let client_map = ClientMap::new(Duration::from_secs(args.timeout), Duration::from_secs(5));
+    let client_map = ClientMap::new(Duration::from_secs(args.timeout));
 
     // Unique server id
     let server_id: i64 = rand::random::<i64>();
@@ -72,23 +71,29 @@ async fn main() -> anyhow::Result<()> {
         let client_map = &client_map;
         let server_id = server_id;
         let remove_ports = args.remove_ports;
-        read_loop(
-            socket,
-            client_map,
-            remote_addr,
-            server_id,
-            remove_ports,
-        )
+        read_loop(socket, client_map, remote_addr, server_id, remove_ports)
     });
 
+    // Removes unused connections periodically
+    let mut cleanup_timer = tokio::time::interval(Duration::from_secs(args.timeout));
+
     let mut read_loops = FuturesUnordered::from_iter(read_loops);
-    select! {
-        _ = read_loops.next() => {
-            error!("A read loop exited unexpectedly");
-        },
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutdown requested, exiting");
-        },
+
+    loop {
+        select! {
+            _ = cleanup_timer.tick() => {
+                trace!("Running client map cleanup");
+                client_map.cleanup();
+            },
+            _ = read_loops.next() => {
+                error!("A read loop exited unexpectedly");
+                break;
+            },
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutdown requested, exiting");
+                break;
+            },
+        }
     }
 
     Ok(())
@@ -111,9 +116,10 @@ async fn read_loop(
                 }
 
                 trace!(
-                    "Received {} bytes from client {}, sending to {}",
+                    "Received {} bytes from client {} through {}, sending to {}",
                     len,
                     addr,
+                    listener.local_addr().unwrap(),
                     remote
                 );
 
@@ -136,12 +142,8 @@ async fn read_loop(
                     if *packet_id == proto::UNCONNECTED_PING_ID {
                         info!("Received LAN ping from client: {}", addr);
                         if server_offline {
-                            let pong = rewrite_unconnected_pong(
-                                &listener,
-                                server_id,
-                                remove_ports,
-                                &data,
-                            );
+                            let pong =
+                                rewrite_unconnected_pong(&listener, server_id, remove_ports, &data);
                             let _ = listener.send(&pong.unwrap()).await;
                         }
                     }
