@@ -1,9 +1,32 @@
 use anyhow::anyhow;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read};
+use lazy_static::lazy_static;
 
 pub const UNCONNECTED_PING_ID: u8 = 0x01;
 pub const UNCONNECTED_PONG_ID: u8 = 0x1C;
+
+lazy_static! {
+    pub static ref OFFLINE_PONG: Vec<u8> = build_unconnected_pong(&UnconnectedPing {
+        ping_time: [0, 0, 0, 0, 0, 0, 0, 0],
+        id: [0, 0, 0, 0, 0, 0, 0, 0],
+        magic: [0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78],
+        pong: PongData {
+            edition: String::from("MCPE"),
+            motd: String::from("phantom-rust §cServer offline"),
+            protocol_version: String::from("390"),
+            version: String::from("1.14.60"),
+            players: String::from("0"),
+            max_players: String::from("0"),
+            server_id: String::new(),
+            submotd: String::new(),
+            game_type: String::from("Creative"),
+            nintendo_limited: String::from("1"),
+            port4: String::new(),
+            port6: String::new(),
+        },
+    });
+}
 
 #[derive(Debug, Clone)]
 pub struct UnconnectedPing {

@@ -144,7 +144,7 @@ async fn read_loop(
                     if *packet_id == proto::UNCONNECTED_PING_ID {
                         info!("Received LAN ping from client: {}", addr);
                         if server_offline {
-                            match rewrite_unconnected_pong(&listener, server_id, remove_ports, &data) {
+                            match rewrite_unconnected_pong(&listener, server_id, remove_ports, &proto::OFFLINE_PONG) {
                                 Ok(pong) => {
                                     let _ = listener.send_to(&pong, addr).await;
                                 }
@@ -195,7 +195,7 @@ async fn proxy_server_reader(
     proxy_socket: Rc<UdpSocket>,
 ) {
     let mut buf = vec![0u8; MAX_MTU];
-
+    
     loop {
         match server_socket.recv(&mut buf).await {
             Ok(len) => {
