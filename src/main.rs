@@ -138,8 +138,6 @@ async fn read_loop(
                     });
                 }
                 if let Some(packet_id) = buf.get(0) {
-                    // TODO
-                    // If server is offline, respond with empty pong
                     let server_offline = false;
                     if *packet_id == proto::UNCONNECTED_PING_ID {
                         info!("Received LAN ping from client: {}", addr);
@@ -214,6 +212,8 @@ async fn proxy_server_reader(
                 let _ = proxy_socket.send_to(&data, client).await;
             }
             Err(e) => {
+                // TODO
+                // If server is offline, respond with empty pong
                 warn!("server read error: {}", e);
                 break;
             }
