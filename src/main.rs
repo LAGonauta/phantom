@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
 
     pretty_env_logger::init_timed();
 
-    if kernel::has_support().await {
+    if !args.disable_kernel_proxy && kernel::has_support().await {
         LocalSet::new().run_until(kernel::start(args)).await
     } else {
         LocalSet::new().run_until(fallback::start(args)).await
