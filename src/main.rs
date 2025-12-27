@@ -110,50 +110,65 @@ async fn read_loop(
     let mut buf = vec![0u8; MAX_MTU];
 
     // TODO: cleanup old entries after timeout
-    let mut unconnection_map: HashMap<SocketAddr, Sender<Vec<u8>>> = HashMap::new();
+    let timeout = Duration::from_secs(60);
+    let mut cleanup_timer = tokio::time::interval(timeout);
+    let mut unconnection_map: HashMap<SocketAddr, (Sender<Vec<u8>>, Instant)> = HashMap::new();
     loop {
-        match listener.recv_from(&mut buf).await {
-            Ok((len, addr)) => {
-                if len == 0 {
-                    continue;
-                }
-
-                trace!(
-                    "Received {} bytes from client {} through {}, sending to {}",
-                    len,
-                    addr,
-                    listener.local_addr().unwrap(),
-                    remote
-                );
-
-                let sender = match unconnection_map.entry(addr) {
-                    Entry::Occupied(o) => {
-                        debug!("Reusing existing proxy loop for client {}", addr);
-                        o.get().clone()
+        select! {
+            now = cleanup_timer.tick() => {
+                unconnection_map.retain(|addr, (_sender, last_used)| {
+                    if now.duration_since(*last_used) > timeout {
+                        debug!("Removing inactive unconnected sender loop for client {}", addr);
+                        false
+                    } else {
+                        true
                     }
-                    Entry::Vacant(v) => {
-                        let (s, r) = flume::unbounded();
-                        let client_socket =
-                            try_create_connected_socket(listener.local_addr().unwrap(), addr)
-                                .unwrap();
-                        spawn_local(proxy_loop(
-                            r,
-                            client_socket,
-                            remote,
-                            server_id,
-                            remove_ports,
-                        ));
-                        v.insert(s).clone()
+                });
+            },
+            result = listener.recv_from(&mut buf) => match result {
+                Ok((len, addr)) => {
+                    if len == 0 {
+                        continue;
                     }
-                };
-                if let Err(e) = sender.send_async(buf[..len].to_vec()).await {
-                    warn!("Failed to send data to proxy loop for {}: {}", addr, e);
-                    unconnection_map.remove(&addr);
+
+                    trace!(
+                        "Received {} bytes from client {} through {}, sending to {}",
+                        len,
+                        addr,
+                        listener.local_addr().unwrap(),
+                        remote
+                    );
+
+                    let sender = match unconnection_map.entry(addr) {
+                        Entry::Occupied(mut o) => {
+                            debug!("Reusing existing proxy loop for client {}", addr);
+                            o.get_mut().1 = Instant::now();
+                            o.get().0.clone()
+                        },
+                        Entry::Vacant(v) => {
+                            let (s, r) = flume::unbounded();
+                            let client_socket =
+                                try_create_connected_socket(listener.local_addr().unwrap(), addr)
+                                    .unwrap();
+                            spawn_local(proxy_loop(
+                                r,
+                                client_socket,
+                                remote,
+                                server_id,
+                                remove_ports,
+                            ));
+                            v.insert((s, Instant::now())).0.clone()
+                        }
+                    };
+                    if let Err(e) = sender.send_async(buf[..len].to_vec()).await {
+                        warn!("Failed to send data to proxy loop for {}: {}", addr, e);
+                        unconnection_map.remove(&addr);
+                    }
                 }
-            }
-            Err(e) => {
-                error!("Unable to receive data from listener: {}", e);
-                break;
+                Err(e) => {
+                    error!("Unable to receive data from listener: {}", e);
+                    break;
+                }
             }
         }
     }
@@ -252,7 +267,6 @@ async fn proxy_loop(
                 }
 
             },
-            // TODO: ignore when the sender of unconnected_recv gets dropped
             client_result = unconnected_recv.recv_async(), if !unconnected_recv.is_disconnected() => {
                 match client_result {
                     Ok(data) => {
