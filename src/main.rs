@@ -2,7 +2,7 @@ use clap::Parser;
 use tokio::task::LocalSet;
 
 use crate::config::Args;
-use crate::proxy::kernel;
+use crate::proxy::{fallback, kernel};
 
 mod proto;
 mod proxy;
@@ -14,5 +14,9 @@ async fn main() -> anyhow::Result<()> {
 
     pretty_env_logger::init_timed();
 
-    LocalSet::new().run_until(kernel::start(args)).await
+    if kernel::has_support().await {
+        LocalSet::new().run_until(kernel::start(args)).await
+    } else {
+        LocalSet::new().run_until(fallback::start(args)).await
+    }
 }
