@@ -8,8 +8,7 @@ use std::rc::Rc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::select;
-use tokio::task::spawn_local;
-use tokio::time::sleep;
+use tokio::task::{spawn_local, LocalSet};
 
 mod clientmap;
 mod proto;
@@ -31,12 +30,16 @@ struct Args {
     remove_ports: bool,
 }
 
-#[tokio::main(flavor = "local")]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     pretty_env_logger::init_timed();
 
+    LocalSet::new().run_until(start(args)).await
+}
+
+async fn start(args: Args) -> anyhow::Result<()> {
     info!("Starting up with remote server IP: {}", args.server);
 
     // Resolve remote server
@@ -126,39 +129,54 @@ async fn read_loop(
 
                 let data = buf[..len].to_vec();
 
-                // Use same proxy logic as main listener: forward to server via per-client socket
-                let (server_socket, created) = client_map.get(addr, remote).await.unwrap();
+                match client_map.get(addr, remote).await {
+                    Ok((server_socket, created)) => {
+                        if created {
+                            // spawn reader for server->client
+                            let server_socket = server_socket.clone();
+                            let listener = listener.clone();
+                            spawn_local(async move {
+                                proxy_server_reader(server_socket, addr, listener).await;
+                            });
+                        }
 
-                if created {
-                    // spawn reader for server->client
-                    let server_socket = server_socket.clone();
-                    let listener = listener.clone();
-                    spawn_local(async move {
-                        proxy_server_reader(server_socket, addr, listener).await;
-                    });
-                }
-                if let Some(packet_id) = buf.get(0) {
-                    let server_offline = false;
-                    if *packet_id == proto::UNCONNECTED_PING_ID {
-                        info!("Received LAN ping from client: {}", addr);
-                        if server_offline {
-                            match rewrite_unconnected_pong(&listener, server_id, remove_ports, &proto::OFFLINE_PONG) {
-                                Ok(pong) => {
-                                    let _ = listener.send_to(&pong, addr).await;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to build pong response: {}", e);
+                        if let Some(packet_id) = buf.get(0) {
+                            if *packet_id == proto::UNCONNECTED_PING_ID {
+                                info!("Received LAN ping from client {}", addr);
+                            }
+                        }
+
+                        // TODO: logic to figure out if server is offline and respond with empty pong if necessary
+
+                        let _ = server_socket.send(&data).await;
+                    }
+                    Err(e) => {
+                        // Mighty happen if we exhaust the server resources (e.g. ports)
+                        warn!("Failed to get/create client mapping: {}", e);
+                        if let Some(packet_id) = buf.get(0) {
+                            if *packet_id == proto::UNCONNECTED_PING_ID {
+                                info!("Received LAN ping from client {} but server cannot be reached, rewritting pong", addr);
+                                match rewrite_unconnected_pong(
+                                    &listener,
+                                    server_id,
+                                    remove_ports,
+                                    &proto::OFFLINE_PONG,
+                                ) {
+                                    Ok(pong) => {
+                                        let _ = listener.send_to(&pong, addr).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to build pong response: {}", e);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-
-                let _ = server_socket.send(&data).await;
             }
             Err(e) => {
-                warn!("ping listener error: {}", e);
-                sleep(Duration::from_millis(100)).await;
+                error!("Unable to receive data from listener: {}", e);
+                break;
             }
         }
     }
@@ -171,8 +189,8 @@ fn rewrite_unconnected_pong(
     data: &Vec<u8>,
 ) -> Result<Vec<u8>> {
     proto::read_unconnected_ping(data).map(|mut ping| {
-		// Overwrite the server ID with one unique to this phantom instance.
-		// If we don't do this, the client will get confused if you restart phantom.
+        // Overwrite the server ID with one unique to this phantom instance.
+        // If we don't do this, the client will get confused if you restart phantom.
         ping.pong.server_id = server_id.to_string();
 
         if ping.pong.port4 != "" && !remove_ports {
@@ -193,7 +211,7 @@ async fn proxy_server_reader(
     proxy_socket: Rc<UdpSocket>,
 ) {
     let mut buf = vec![0u8; MAX_MTU];
-    
+
     loop {
         match server_socket.recv(&mut buf).await {
             Ok(len) => {
