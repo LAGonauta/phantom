@@ -141,7 +141,7 @@ async fn read_loop(
 
                     let sender = match unconnection_map.entry(addr) {
                         Entry::Occupied(mut o) => {
-                            debug!("Reusing existing proxy loop for client {}", addr);
+                            trace!("Reusing existing proxy loop for client {}", addr);
                             o.get_mut().1 = Instant::now();
                             o.get().0.clone()
                         },
@@ -221,6 +221,8 @@ fn try_create_connected_socket(
     // 2. Bind to the same listener
     socket.bind(&listener_addr.into())?;
 
+    // TODO: as per Cloudflare article, there is an unconnected race here.
+
     // 3. Connect to the specific client
     // This effectively "filters" this socket to only receive packets from this peer
     socket.connect(&peer_addr.into())?;
@@ -236,7 +238,7 @@ async fn proxy_loop(
     server_id: i64,
     remove_ports: bool,
 ) -> anyhow::Result<()> {
-    let local = match client_socket.local_addr().unwrap().ip() {
+    let local = match remote_addr.ip() {
         std::net::IpAddr::V4(_) => "0.0.0.0:0",
         std::net::IpAddr::V6(_) => "[::]:0",
     };
@@ -265,7 +267,6 @@ async fn proxy_loop(
                     debug!("No activity for {:#?}, closing read loop for client {}", timeout, client_socket.peer_addr().unwrap());
                     break;
                 }
-
             },
             client_result = unconnected_recv.recv_async(), if !unconnected_recv.is_disconnected() => {
                 match client_result {
