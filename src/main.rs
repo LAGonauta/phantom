@@ -221,8 +221,6 @@ fn try_create_connected_socket(
     // 2. Bind to the same listener
     socket.bind(&listener_addr.into())?;
 
-    // TODO: as per Cloudflare article, there is an unconnected race here.
-
     // 3. Connect to the specific client
     // This effectively "filters" this socket to only receive packets from this peer
     socket.connect(&peer_addr.into())?;
@@ -238,6 +236,7 @@ async fn proxy_loop(
     server_id: i64,
     remove_ports: bool,
 ) -> anyhow::Result<()> {
+    let client_addr = client_socket.peer_addr()?;
     let local = match remote_addr.ip() {
         std::net::IpAddr::V4(_) => "0.0.0.0:0",
         std::net::IpAddr::V6(_) => "[::]:0",
@@ -264,7 +263,7 @@ async fn proxy_loop(
                     && now.duration_since(last_server_message) > timeout
                 {
                     // TODO: send unconnected pong when the server is offline, but break if the client is gone
-                    debug!("No activity for {:#?}, closing read loop for client {}", timeout, client_socket.peer_addr().unwrap());
+                    debug!("No activity for {:#?}, closing read loop for client {}", timeout, client_addr);
                     break;
                 }
             },
@@ -277,7 +276,7 @@ async fn proxy_loop(
                         trace!(
                             "Received {} bytes from client {} (channel), sending to {}",
                             data.len(),
-                            client_socket.peer_addr().unwrap(),
+                            client_addr,
                             remote_addr
                         );
                         let _ = remote_sock.send(&data).await;
@@ -287,18 +286,26 @@ async fn proxy_loop(
                     }
                 }
             },
-            client_result = client_socket.recv(&mut client_buf) => {
+            client_result = client_socket.recv_from(&mut client_buf) => {
                 last_client_message = Instant::now();
                 match client_result {
-                    Ok(client_len) => {
+                    Ok((client_len, addr)) => {
                         if client_len == 0 {
+                            continue;
+                        }
+
+                        // As per Cloudflare article, we might get packets from other addresses
+                        // due to a possible race condition, so we need to verify the source address
+                        // to ensure all is good
+                        if addr != client_addr {
+                            warn!("Received packet from unexpected address {} (expected {})", addr, client_addr);
                             continue;
                         }
                         let data = client_buf[..client_len].to_vec();
                         trace!(
                             "Received {} bytes from client {}, sending to {}",
                             client_len,
-                            client_socket.peer_addr().unwrap(),
+                            addr,
                             remote_addr
                         );
                         let _ = remote_sock.send_to(&data, remote_addr).await;
@@ -321,7 +328,7 @@ async fn proxy_loop(
                             "Received {} bytes from server {}, sending to {}",
                             server_len,
                             remote_addr,
-                            client_socket.peer_addr().unwrap(),
+                            client_addr,
                         );
                         let _ = client_socket.send(&data).await;
                     }
