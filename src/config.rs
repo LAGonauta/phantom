@@ -11,9 +11,9 @@ pub struct Args {
     #[arg(long = "timeout", default_value_t = 60)]
     pub timeout: u64,
 
-    #[arg(long = "remove_ports")]
+    #[arg(long = "remove-ports")]
     pub remove_ports: bool,
 
-    #[arg(long = "disable_kernel_proxy", default_value_t = false, help = "Disables kernel-based proxy even if supported")]
+    #[arg(long = "disable-kernel-proxy", default_value_t = false, help = "Disables kernel-based proxy even if supported")]
     pub disable_kernel_proxy: bool,
 }
