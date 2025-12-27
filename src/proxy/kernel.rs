@@ -192,7 +192,10 @@ async fn proxy_loop(
     let mut last_client_message = Instant::now();
     let mut last_server_message = Instant::now();
 
-    debug!("Connected client {} to remote server {}", client_addr, remote_addr);
+    debug!(
+        "Connected client {} to remote server {}",
+        client_addr, remote_addr
+    );
     loop {
         select! {
             now = cleanup_timer.tick() => {
@@ -204,6 +207,7 @@ async fn proxy_loop(
                     break;
                 }
             },
+            // From the unconnected socket
             client_result = unconnected_recv.recv_async(), if !unconnected_recv.is_disconnected() => {
                 match client_result {
                     Ok(data) => {
