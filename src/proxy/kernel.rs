@@ -86,10 +86,9 @@ pub async fn start(args: Args) -> Result<()> {
 }
 
 pub async fn has_support() -> bool {
-    // TODO: use [::] instead
     try_create_connected_socket(
-        SocketAddr::from(([127, 0, 0, 1], 0)),
-        SocketAddr::from(([127, 0, 0, 1], 0)),
+        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0)),
+        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0)),
     )
     .is_ok()
 }
