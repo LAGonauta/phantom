@@ -191,6 +191,8 @@ async fn proxy_loop(
 
     let mut last_client_message = Instant::now();
     let mut last_server_message = Instant::now();
+
+    debug!("Connected client {} to remote server {}", client_addr, remote_addr);
     loop {
         select! {
             now = cleanup_timer.tick() => {
