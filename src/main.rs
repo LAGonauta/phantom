@@ -60,9 +60,20 @@ async fn start(args: Args) -> anyhow::Result<()> {
     let mut sockets = Vec::new();
     for addr in local_addrs {
         info!("Trying to listen on {}", addr);
-        let socket = UdpSocket::bind(addr).await?;
-        info!("Listening on {}", socket.local_addr()?);
-        sockets.push(Rc::new(socket));
+
+        let s2 = socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        s2.set_reuse_address(true)?;
+        s2.set_reuse_port(true)?;
+        s2.set_nonblocking(true)?;
+        s2.bind(&addr.into())?;
+
+        let s = UdpSocket::from_std(s2.into())?;
+        info!("Listening on {}", s.local_addr()?);
+        sockets.push(Rc::new(s));
     }
 
     let client_map = ClientMap::new(Duration::from_secs(args.timeout));
