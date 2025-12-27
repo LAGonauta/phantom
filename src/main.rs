@@ -253,7 +253,7 @@ async fn proxy_loop(
 
             },
             // TODO: ignore when the sender of unconnected_recv gets dropped
-            client_result = unconnected_recv.recv_async() => {
+            client_result = unconnected_recv.recv_async(), if !unconnected_recv.is_disconnected() => {
                 match client_result {
                     Ok(data) => {
                         if data.len() == 0 {
@@ -268,8 +268,7 @@ async fn proxy_loop(
                         let _ = remote_sock.send(&data).await;
                     }
                     Err(e) => {
-                        warn!("unconnected recv error: {}", e);
-                        break;
+                        warn!("Got unconnected recv error: {}", e);
                     }
                 }
             },
