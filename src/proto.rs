@@ -1,6 +1,8 @@
 use anyhow::anyhow;
+use anyhow::Result;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use std::io::{Cursor, Read};
+use tokio::net::UdpSocket;
+use std::{io::{Cursor, Read}, rc::Rc};
 use lazy_static::lazy_static;
 
 pub const UNCONNECTED_PING_ID: u8 = 0x01;
@@ -157,4 +159,27 @@ fn write_pong(p: &PongData) -> String {
     }
 
     format!("{};", fields.join(";"))
+}
+
+pub fn rewrite_unconnected_pong(
+    proxy_socket: &Rc<UdpSocket>,
+    server_id: i64,
+    remove_ports: bool,
+    data: &Vec<u8>,
+) -> Result<Vec<u8>> {
+    read_unconnected_ping(data).map(|mut ping| {
+        // Overwrite the server ID with one unique to this phantom instance.
+        // If we don't do this, the client will get confused if you restart phantom.
+        ping.pong.server_id = server_id.to_string();
+
+        if ping.pong.port4 != "" && !remove_ports {
+            ping.pong.port4 = proxy_socket.local_addr().unwrap().port().to_string();
+            ping.pong.port6 = ping.pong.port4.clone();
+        } else if remove_ports {
+            ping.pong.port4 = "".to_string();
+            ping.pong.port6 = "".to_string();
+        }
+
+        build_unconnected_pong(&ping)
+    })
 }
