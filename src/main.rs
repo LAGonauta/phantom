@@ -3,17 +3,16 @@ use clap::Parser;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use log::{error, info, trace, warn};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::select;
 use tokio::task::{spawn_local, LocalSet};
+use tokio::time::Instant;
 
-mod clientmap;
 mod proto;
-
-use clientmap::ClientMap;
 
 const MAX_MTU: usize = 1472;
 
@@ -76,30 +75,20 @@ async fn start(args: Args) -> anyhow::Result<()> {
         sockets.push(Rc::new(s));
     }
 
-    let client_map = ClientMap::new(Duration::from_secs(args.timeout));
-
     // Unique server id
     let server_id: i64 = rand::random::<i64>();
 
     let read_loops = sockets.into_iter().map(|socket| {
         let remote_addr = remote_addr.clone();
-        let client_map = &client_map;
         let server_id = server_id;
         let remove_ports = args.remove_ports;
-        read_loop(socket, client_map, remote_addr, server_id, remove_ports)
+        read_loop(socket, remote_addr, server_id, remove_ports)
     });
-
-    // Removes unused connections periodically
-    let mut cleanup_timer = tokio::time::interval(Duration::from_secs(args.timeout));
 
     let mut read_loops = FuturesUnordered::from_iter(read_loops);
 
     loop {
         select! {
-            _ = cleanup_timer.tick() => {
-                trace!("Running client map cleanup");
-                client_map.cleanup();
-            },
             _ = read_loops.next() => {
                 error!("A read loop exited unexpectedly");
                 break;
@@ -116,7 +105,6 @@ async fn start(args: Args) -> anyhow::Result<()> {
 
 async fn read_loop(
     listener: Rc<UdpSocket>,
-    client_map: &ClientMap,
     remote: SocketAddr,
     server_id: i64,
     remove_ports: bool,
@@ -138,52 +126,56 @@ async fn read_loop(
                     remote
                 );
 
-                let data = buf[..len].to_vec();
+                let client_socket =
+                    try_create_connected_socket(listener.local_addr().unwrap(), addr).unwrap();
+                spawn_local(proxy_loop(client_socket, remote));
 
-                match client_map.get(addr, remote).await {
-                    Ok((server_socket, created)) => {
-                        if created {
-                            // spawn reader for server->client
-                            let server_socket = server_socket.clone();
-                            let listener = listener.clone();
-                            spawn_local(async move {
-                                proxy_server_reader(server_socket, addr, listener).await;
-                            });
-                        }
+                //let data = buf[..len].to_vec();
 
-                        if let Some(packet_id) = buf.get(0) {
-                            if *packet_id == proto::UNCONNECTED_PING_ID {
-                                info!("Received LAN ping from client {}", addr);
-                            }
-                        }
+                // match client_map.get(addr, remote).await {
+                //     Ok((server_socket, created)) => {
+                //         if created {
+                //             // spawn reader for server->client
+                //             let server_socket = server_socket.clone();
+                //             let listener = listener.clone();
+                //             spawn_local(async move {
+                //                 proxy_server_reader(server_socket, addr, listener).await;
+                //             });
+                //         }
 
-                        // TODO: logic to figure out if server is offline and respond with empty pong if necessary
+                //         if let Some(packet_id) = buf.get(0) {
+                //             if *packet_id == proto::UNCONNECTED_PING_ID {
+                //                 info!("Received LAN ping from client {}", addr);
+                //             }
+                //         }
 
-                        let _ = server_socket.send(&data).await;
-                    }
-                    Err(e) => {
-                        // Mighty happen if we exhaust the server resources (e.g. ports)
-                        warn!("Failed to get/create client mapping: {}", e);
-                        if let Some(packet_id) = buf.get(0) {
-                            if *packet_id == proto::UNCONNECTED_PING_ID {
-                                info!("Received LAN ping from client {} but server cannot be reached, rewritting pong", addr);
-                                match rewrite_unconnected_pong(
-                                    &listener,
-                                    server_id,
-                                    remove_ports,
-                                    &proto::OFFLINE_PONG,
-                                ) {
-                                    Ok(pong) => {
-                                        let _ = listener.send_to(&pong, addr).await;
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to build pong response: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                //         // TODO: logic to figure out if server is offline and respond with empty pong if necessary
+
+                //         let _ = server_socket.send(&data).await;
+                //     }
+                //     Err(e) => {
+                //         // Mighty happen if we exhaust the server resources (e.g. ports)
+                //         warn!("Failed to get/create client mapping: {}", e);
+                //         if let Some(packet_id) = buf.get(0) {
+                //             if *packet_id == proto::UNCONNECTED_PING_ID {
+                //                 info!("Received LAN ping from client {} but server cannot be reached, rewritting pong", addr);
+                //                 match rewrite_unconnected_pong(
+                //                     &listener,
+                //                     server_id,
+                //                     remove_ports,
+                //                     &proto::OFFLINE_PONG,
+                //                 ) {
+                //                     Ok(pong) => {
+                //                         let _ = listener.send_to(&pong, addr).await;
+                //                     }
+                //                     Err(e) => {
+                //                         warn!("Failed to build pong response: {}", e);
+                //                     }
+                //                 }
+                //             }
+                //         }
+                //     }
+                // }
             }
             Err(e) => {
                 error!("Unable to receive data from listener: {}", e);
@@ -250,4 +242,123 @@ async fn proxy_server_reader(
     }
 
     // When server read loop exits, client mapping should be removed by cleanup loop
+}
+
+/// Tries to create a specialized "Connected" socket.
+/// If the OS doesn't support the required flags, it returns None.
+fn try_create_connected_socket(
+    listener_addr: SocketAddr,
+    peer_addr: SocketAddr,
+) -> Result<UdpSocket> {
+    trace!("Creating connected socket for peer {} while listening to {}", peer_addr, listener_addr);
+    let socket = Socket::new(
+        Domain::for_address(listener_addr),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+
+    socket.set_nonblocking(true)?;
+
+    // 1. Set the Platform-Specific Flags
+    // On Unix/Linux, we need SO_REUSEPORT to share the port with the main listener.
+    #[cfg(unix)]
+    {
+        socket.set_reuse_port(true)?;
+        socket.set_reuse_address(true)?;
+    }
+
+    // On Windows, SO_REUSEADDR acts like SO_REUSEPORT
+    #[cfg(windows)]
+    socket.set_reuse_address(true)?;
+
+    // 2. Bind to the same listener
+    socket.bind(&listener_addr.into())?;
+
+    // 3. Connect to the specific client
+    // This effectively "filters" this socket to only receive packets from this peer
+    socket.connect(&peer_addr.into())?;
+
+    // Convert back to std::net::UdpSocket (which can be turned into Tokio/Async socket)
+    Ok(UdpSocket::from_std(socket.into())?)
+}
+
+async fn proxy_loop(client_socket: UdpSocket, remote_addr: SocketAddr) -> anyhow::Result<()> {
+    let local = match client_socket.local_addr().unwrap().ip() {
+        std::net::IpAddr::V4(_) => "0.0.0.0:0",
+        std::net::IpAddr::V6(_) => "[::]:0",
+    };
+
+    // TODO: error when cannot bind
+    let remote_sock = UdpSocket::bind(local).await?;
+    remote_sock.connect(remote_addr).await?;
+    let remote_sock = Rc::new(remote_sock);
+
+    let mut client_buf = vec![0u8; MAX_MTU];
+    let mut server_buf = vec![0u8; MAX_MTU];
+
+    // TODO: exit on timeout, use args.timeout
+    let timeout = Duration::from_secs(60);
+    let mut cleanup_timer = tokio::time::interval(timeout);
+
+    let mut last_client_message = Instant::now();
+    let mut last_server_message = Instant::now();
+    loop {
+        select! {
+                now = cleanup_timer.tick() => {
+                    if now.duration_since(last_client_message) > timeout
+                        && now.duration_since(last_server_message) > timeout
+                    {
+                        // TODO: send unconnected pong when the server is offline, but break if the client is gone
+                        trace!("No activity for {:#?}, closing read loop for client {}", timeout, client_socket.peer_addr().unwrap());
+                        break;
+                    }
+
+                },
+                client_result = client_socket.recv(&mut client_buf) => {
+                    last_client_message = Instant::now();
+                    match client_result {
+                        Ok(client_len) => {
+                            if client_len == 0 {
+                                continue;
+                            }
+                            let data = client_buf[..client_len].to_vec();
+                            trace!(
+                                "Received {} bytes from client {}, sending to {}",
+                                client_len,
+                                client_socket.peer_addr().unwrap(),
+                                remote_addr
+                            );
+                            let _ = remote_sock.send_to(&data, remote_addr).await;
+                        }
+                        Err(e) => {
+                            warn!("client read error: {}", e);
+                            break;
+                        }
+                    }
+                },
+                remote_result = remote_sock.recv(&mut server_buf) => {
+                    last_server_message = Instant::now();
+                    match remote_result {
+                        Ok(server_len) => {
+                            if server_len == 0 {
+                                continue;
+                            }
+                            let data = server_buf[..server_len].to_vec();
+                            trace!(
+                                "Received {} bytes from server {}, sending to {}",
+                                server_len,
+                                remote_addr,
+                                client_socket.peer_addr().unwrap(),
+                            );
+                            let _ = client_socket.send(&data).await;
+                        }
+                        Err(e) => {
+                            warn!("server read error: {}", e);
+                            break;
+                        }
+                    }
+            }
+        }
+    }
+    Ok(())
 }
