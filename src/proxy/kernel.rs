@@ -181,9 +181,8 @@ async fn proxy_loop(
     };
 
     // TODO: error when cannot bind
-    let remote_sock = UdpSocket::bind(local).await?;
-    remote_sock.connect(remote_addr).await?;
-    let remote_sock = Rc::new(remote_sock);
+    let remote_socket = UdpSocket::bind(local).await?;
+    remote_socket.connect(remote_addr).await?;
 
     let mut client_buf = vec![0u8; MAX_MTU];
     let mut server_buf = vec![0u8; MAX_MTU];
@@ -215,7 +214,7 @@ async fn proxy_loop(
                             client_addr,
                             remote_addr
                         );
-                        let _ = remote_sock.send(&data).await;
+                        let _ = remote_socket.send(&data).await;
                     }
                     Err(e) => {
                         warn!("Got unconnected recv error: {}", e);
@@ -244,7 +243,8 @@ async fn proxy_loop(
                             addr,
                             remote_addr
                         );
-                        let _ = remote_sock.send_to(&data, remote_addr).await;
+                        // TODO: to not block the loop
+                        let _ = remote_socket.send_to(&data, remote_addr).await;
                     }
                     Err(e) => {
                         warn!("client read error: {}", e);
@@ -252,7 +252,7 @@ async fn proxy_loop(
                     }
                 }
             },
-            remote_result = remote_sock.recv(&mut server_buf) => {
+            remote_result = remote_socket.recv(&mut server_buf) => {
                 last_server_message = Instant::now();
                 match remote_result {
                     Ok(server_len) => {
@@ -266,6 +266,7 @@ async fn proxy_loop(
                             remote_addr,
                             client_addr,
                         );
+                        // TODO: to not block the loop
                         let _ = client_socket.send(&data).await;
                     }
                     Err(e) => {
