@@ -1,7 +1,7 @@
 use anyhow::Result;
-use flume::Sender;
+use flume::{Sender, select};
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use futures::{StreamExt, pin_mut};
 use log::{debug, error, info, trace, warn};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::hash_map::Entry;
@@ -167,7 +167,7 @@ async fn read_loop(
 }
 
 async fn proxy_loop(
-    timeout: Duration,
+    connection_timeout: Duration,
     unconnected_recv: flume::Receiver<Vec<u8>>,
     client_socket: UdpSocket,
     remote_addr: SocketAddr,
@@ -184,104 +184,116 @@ async fn proxy_loop(
     let remote_socket = UdpSocket::bind(local).await?;
     remote_socket.connect(remote_addr).await?;
 
-    let mut client_buf = vec![0u8; MAX_MTU];
-    let mut server_buf = vec![0u8; MAX_MTU];
-
-    let mut cleanup_timer = tokio::time::interval(timeout);
-
-    let mut last_client_message = Instant::now();
-    let mut last_server_message = Instant::now();
-
     debug!(
         "Connected client {} to remote server {}",
         client_addr, remote_addr
     );
-    loop {
-        select! {
-            now = cleanup_timer.tick() => {
-                if now.duration_since(last_client_message) > timeout
-                    && now.duration_since(last_server_message) > timeout
-                {
-                    // TODO: send unconnected pong when the server is offline, but break if the client is gone
-                    debug!("No activity for {:#?}, closing read loop for client {}", timeout, client_addr);
-                    break;
-                }
-            },
-            // From the unconnected socket
-            client_result = unconnected_recv.recv_async(), if !unconnected_recv.is_disconnected() => {
-                match client_result {
-                    Ok(data) => {
-                        if data.len() == 0 {
-                            continue;
-                        }
-                        trace!(
-                            "Received {} bytes from client {} (channel), sending to {}",
-                            data.len(),
-                            client_addr,
-                            remote_addr
-                        );
-                        let _ = remote_socket.send(&data).await;
-                    }
-                    Err(e) => {
-                        warn!("Got unconnected recv error: {}", e);
-                    }
-                }
-            },
-            client_result = client_socket.recv_from(&mut client_buf) => {
-                last_client_message = Instant::now();
-                match client_result {
-                    Ok((client_len, addr)) => {
-                        if client_len == 0 {
-                            continue;
-                        }
 
-                        // As per Cloudflare article, we might get packets from other addresses
-                        // due to a possible race condition, so we need to verify the source address
-                        // to ensure all is good
-                        if addr != client_addr {
-                            warn!("Received packet from unexpected address {} (expected {})", addr, client_addr);
-                            continue;
+    // Multiple tasks so we can read and send from/to both sockets simultaneously
+    let client_to_server_task = async {
+        let mut buf = vec![0u8; MAX_MTU];
+        loop {
+            select! {
+                // From the unconnected socket
+                client_result = unconnected_recv.recv_async(), if !unconnected_recv.is_disconnected() => {
+                    match client_result {
+                        Ok(data) => {
+                            if data.len() == 0 {
+                                continue;
+                            }
+                            trace!(
+                                "Received {} bytes from client {} (channel), sending to {}",
+                                data.len(),
+                                client_addr,
+                                remote_addr
+                            );
+                            let _ = remote_socket.send(&data).await;
                         }
-                        let data = client_buf[..client_len].to_vec();
-                        trace!(
-                            "Received {} bytes from client {}, sending to {}",
-                            client_len,
-                            addr,
-                            remote_addr
-                        );
-                        // TODO: to not block the loop
-                        let _ = remote_socket.send_to(&data, remote_addr).await;
+                        Err(e) => {
+                            warn!("Got unconnected recv error: {}", e);
+                        }
                     }
-                    Err(e) => {
+                },
+                client_result = tokio::time::timeout(connection_timeout, client_socket.recv_from(&mut buf)) => match client_result {
+                    Ok(Ok((client_len, addr))) => {
+                            if client_len == 0 {
+                                continue;
+                            }
+
+                            // As per Cloudflare article, we might get packets from other addresses
+                            // due to a possible race condition, so we need to verify the source address
+                            // to ensure all is good
+                            if addr != client_addr {
+                                warn!("Received packet from unexpected address {} (expected {})", addr, client_addr);
+                                continue;
+                            }
+                            let data = buf[..client_len].to_vec();
+                            trace!(
+                                "Received {} bytes from client {}, sending to {}",
+                                client_len,
+                                addr,
+                                remote_addr
+                            );
+                            let _ = remote_socket.send_to(&data, remote_addr).await;
+                        }
+                        Err(e) => {
+                            warn!("client read error: {}", e);
+                            break;
+                        },
+                    Ok(Err(e)) => {
                         warn!("client read error: {}", e);
                         break;
-                    }
-                }
-            },
-            remote_result = remote_socket.recv(&mut server_buf) => {
-                last_server_message = Instant::now();
-                match remote_result {
-                    Ok(server_len) => {
-                        if server_len == 0 {
-                            continue;
-                        }
-                        let data = server_buf[..server_len].to_vec();
-                        trace!(
-                            "Received {} bytes from server {}, sending to {}",
-                            server_len,
-                            remote_addr,
-                            client_addr,
-                        );
-                        // TODO: to not block the loop
-                        let _ = client_socket.send(&data).await;
-                    }
-                    Err(e) => {
-                        warn!("server read error: {}", e);
+                    },
+                    Err(_) => {
+                        // Timeout
+                        debug!("No data from connected client {} for 60 seconds, closing task", client_addr);
                         break;
                     }
+                },
+            }
+        }
+    };
+    pin_mut!(client_to_server_task);
+
+    let server_to_client_task = async {
+        let mut buf = vec![0u8; MAX_MTU];
+        loop {
+            match tokio::time::timeout(connection_timeout, remote_socket.recv(&mut buf)).await {
+                Ok(Ok(server_len)) => {
+                    if server_len == 0 {
+                        continue;
+                    }
+                    let data = buf[..server_len].to_vec();
+                    trace!(
+                        "Received {} bytes from server {}, sending to {}",
+                        server_len,
+                        remote_addr,
+                        client_addr,
+                    );
+                    let _ = client_socket.send(&data).await;
+                }
+                Ok(Err(e)) => {
+                    warn!("server read error: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    // Timeout
+                    debug!("No data from server {} for {} seconds for client {}, marking as offline", remote_addr, connection_timeout.as_secs(), client_addr);
+                    // TODO: send unconnected pong when the server is offline by setting a flag and reading it from the client
+                    // to server loop
                 }
             }
         }
+    };
+    pin_mut!(server_to_client_task);
+
+    select! {
+        _ = &mut client_to_server_task => {
+            debug!("Client to server task ended for client {}", client_addr);
+        },
+        _ = &mut server_to_client_task => {
+            debug!("Server to client task ended for client {}", client_addr);
+        },
     }
     Ok(())
 }
